@@ -41,17 +41,17 @@ type ConnPool struct {
 
 	//internal param
 	activeNum int //current inuse num
-	waitNum   int //等待的数量，不应该超过2倍的MaxActiveNum
+	waitNum   int //wait num
 }
 
 type Conn struct {
 	t    time.Time   //time duration
-	Err  error       // 表示该条链接是否已经出错
-	Inst interface{} //具体的连接实例
-	ID   int         //连接的编号
+	Err  error       // whether the conn is error
+	Inst interface{} //conn instance
+	ID   int         //the id of the conn,given by the connect func
 }
 
-/* new connection pool */
+// new connection pool
 func NewConnectionPool(maxActiveNum int, revIdleNum int, idleTimeout time.Duration, connectFunc func() (interface{}, int, error), disConnectFunc func(c interface{}, id int)) *ConnPool {
 	return &ConnPool{
 		MaxActiveNum:    maxActiveNum,
@@ -63,12 +63,13 @@ func NewConnectionPool(maxActiveNum int, revIdleNum int, idleTimeout time.Durati
 	}
 }
 
+//pop an connection from pool
 func (p *ConnPool) Pop() *Conn {
 	var c *Conn
 
 	p.mu.Lock()
 
-	//遍历关闭超长时间不用的
+	//for loop to close idle timeout conn and close them
 	if timeout := p.IdleTimeout; timeout > 0 {
 		for i, n := p.ReservedIdleNum, p.idlePool.Len(); i < n; i++ {
 			e := p.idlePool.Back()
@@ -93,7 +94,7 @@ func (p *ConnPool) Pop() *Conn {
 			c = e.Value.(*Conn)
 			p.idlePool.Remove(e)
 
-			// 标记当前连接为正在使用
+			// mark as in use
 			p.activeNum += 1
 			p.mu.Unlock()
 			return c
@@ -108,7 +109,7 @@ func (p *ConnPool) Pop() *Conn {
 		if p.MaxActiveNum == 0 || p.activeNum < p.MaxActiveNum {
 			p.activeNum += 1
 			p.mu.Unlock()
-			//新申请
+			//new connection
 			Inst, id, e := p.Connect()
 			if e != nil {
 				p.mu.Lock()
@@ -117,7 +118,7 @@ func (p *ConnPool) Pop() *Conn {
 				log.Printf("connection pool:%s", e.Error())
 				return nil
 			}
-			// 标记当前连接为正在使用
+			// init struct
 			c = &Conn{Inst: Inst, ID: id}
 			return c
 		}
@@ -137,14 +138,14 @@ func (p *ConnPool) Pop() *Conn {
 	}
 }
 
-//对于此c调用push后不允许再次操作此c
+//push an connection to pool.(you shoud not op c after push the conn to pool)
 func (p *ConnPool) Push(c *Conn) {
 	if c == nil {
 		log.Printf("connection pool:[Push] c == nil")
 		return
 	}
 
-	// 如果连接网络出错，直接丢掉
+	// if the conn is err,drop it
 	if c.Err != nil {
 		log.Printf("connection pool:drop error connection,id:%d,err:%s", c.ID, c.Err.Error())
 		p.mu.Lock()
