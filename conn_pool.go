@@ -6,8 +6,8 @@ import (
 	"container/list"
 	"sync"
 	"time"
-
-	"log"
+    "errors"
+    "fmt"
 )
 
 var NowFunc = time.Now // for testing
@@ -29,12 +29,12 @@ type ConnPool struct {
 	// the timeout to a value less than the server's timeout.
 	IdleTimeout time.Duration
 
-	// If Wait is true and the pool is at the MaxActiveNum limit, then Pop() waits
-	// for a connection to be returned to the pool before returning.
-	Wait bool
+	// How many seconds wait for when the pool is at the MaxActiveNum limit
+	//0 forever,-1 no wait
+	WaitTime int64
 
 	mu     sync.RWMutex
-	cond   *sync.Cond
+    cond   *TMOCond
 	closed bool
 
 	idlePool list.List
@@ -52,21 +52,21 @@ type Conn struct {
 }
 
 // new connection pool
-func NewConnectionPool(maxActiveNum int, revIdleNum int, idleTimeout time.Duration, connectFunc func() (interface{}, int, error), disConnectFunc func(c interface{}, id int)) *ConnPool {
+func NewConnectionPool(maxActiveNum int, revIdleNum int, idleTimeout time.Duration, waitTime int64, connectFunc func() (interface{}, int, error), disConnectFunc func(c interface{}, id int)) *ConnPool {
 	return &ConnPool{
 		MaxActiveNum:    maxActiveNum,
 		ReservedIdleNum: revIdleNum,
 		IdleTimeout:     idleTimeout,
-		Wait:            true,
+		WaitTime:        waitTime,
 		Connect:         connectFunc,
 		DisConnect:      disConnectFunc,
 	}
 }
 
 //pop an connection from pool
-func (p *ConnPool) Pop() *Conn {
+func (p *ConnPool) Pop() (*Conn, error) {
 	var c *Conn
-
+    tryed := false
 	p.mu.Lock()
 
 	//for loop to close idle timeout conn and close them
@@ -97,13 +97,13 @@ func (p *ConnPool) Pop() *Conn {
 			// mark as in use
 			p.activeNum += 1
 			p.mu.Unlock()
-			return c
+			return c, nil
 		}
 
 		// Check for pool closed before dialing a new connection.
 		if p.closed {
 			p.mu.Unlock()
-			return nil
+			return nil, errors.New("pool closed")
 		}
 
 		if p.MaxActiveNum == 0 || p.activeNum < p.MaxActiveNum {
@@ -115,45 +115,54 @@ func (p *ConnPool) Pop() *Conn {
 				p.mu.Lock()
 				p.activeNum -= 1
 				p.mu.Unlock()
-				log.Printf("connection pool:%s", e.Error())
-				return nil
+				return nil, fmt.Errorf("connection pool:%s", e.Error())
 			}
+
 			// init struct
 			c = &Conn{Inst: Inst, ID: id}
-			return c
+			return c, nil
 		}
 
-		if !p.Wait {
+        //no wait
+		if p.WaitTime < 0 {
 			p.mu.Unlock()
-			return nil
+			return nil, nil
 		}
 
-		if p.cond == nil {
-			p.cond = sync.NewCond(&p.mu)
-		}
+        if tryed {
+            return nil, errors.New("pop wait timeout")
+        }
 
-		p.waitNum += 1
-		p.cond.Wait()
-		p.waitNum -= 1
+        if p.cond == nil {
+            p.cond = NewTMOCond(&p.mu)
+        }
+
+        p.waitNum += 1
+        if p.WaitTime > 0 {
+            p.cond.WaitOrTimeout(time.Second * time.Duration(p.WaitTime))
+            tryed = true
+        }else {
+            p.cond.Wait()
+        }
+        p.waitNum -= 1
 	}
 }
 
 //push an connection to pool.(you shoud not op c after push the conn to pool)
-func (p *ConnPool) Push(c *Conn) {
+func (p *ConnPool) Push(c *Conn) error {
 	if c == nil {
-		log.Printf("connection pool:[Push] c == nil")
-		return
+		return errors.New("connection pool:[Push] c == nil")
 	}
 
 	// if the conn is err,drop it
 	if c.Err != nil {
-		log.Printf("connection pool:drop error connection,id:%d,err:%s", c.ID, c.Err.Error())
 		p.mu.Lock()
 		p.activeNum -= 1
 		p.mu.Unlock()
 		p.DisConnect(c.Inst, c.ID)
-		return
-	}
+		//return fmt.Errorf("connection pool:drop error connection,id:%d,err:%s", c.ID, c.Err.Error())
+        return nil
+    }
 
 	c.t = NowFunc()
 
@@ -165,6 +174,7 @@ func (p *ConnPool) Push(c *Conn) {
 	}
 
 	p.mu.Unlock()
+    return nil
 }
 
 func (p *ConnPool) GetActiveNum() int {
